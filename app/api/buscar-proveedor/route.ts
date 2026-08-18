@@ -19,8 +19,15 @@ export async function OPTIONS() {
  * Excel interno (ver /BuscadorProveedores en el repo) no tiene dirección,
  * redes sociales ni sitio web, así que esos tres campos solo pueden venir
  * de una búsqueda real en internet. Se usa Serper.dev (resultados de Google)
- * porque tiene una capa gratuita sin tarjeta y responde con un
- * "knowledgeGraph" ya estructurado cuando el negocio tiene ficha de Google.
+ * porque tiene una capa gratuita sin tarjeta.
+ *
+ * Dos modos, según si se escribió un nombre puntual o no:
+ * - Nombre puntual (proveedor de la base, o texto libre escrito a mano):
+ *   se usa /search y su "knowledgeGraph" (ficha de un solo negocio) +
+ *   resultados orgánicos para sacar redes sociales y un link "ver más".
+ * - Sin nombre puntual (solo categoría/municipio/región, ej. "Proveedores de
+ *   Alimentación"): se usa /places (resultados tipo Google Maps) para traer
+ *   un LISTADO de varios negocios candidatos con nombre/dirección/teléfono.
  */
 
 const DOMINIOS_REDES_SOCIALES: { dominio: string; red: string }[] = [
@@ -53,13 +60,93 @@ interface SerperOrganicResult {
   snippet?: string;
 }
 
-interface SerperResponse {
+interface SerperSearchResponse {
   knowledgeGraph?: {
     address?: string;
     phoneNumber?: string;
     website?: string;
   };
   organic?: SerperOrganicResult[];
+}
+
+interface SerperPlace {
+  title?: string;
+  address?: string;
+  phoneNumber?: string;
+  website?: string;
+  rating?: number;
+  category?: string;
+}
+
+interface SerperPlacesResponse {
+  places?: SerperPlace[];
+}
+
+async function buscarUnProveedor(apiKey: string, query: string) {
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: query, gl: "co", hl: "es", num: 10 }),
+  });
+  if (!resp.ok) throw new Error(`Serper /search respondió ${resp.status}`);
+  const serperData = (await resp.json()) as SerperSearchResponse;
+
+  const kg = serperData.knowledgeGraph;
+  const organic = Array.isArray(serperData.organic) ? serperData.organic : [];
+
+  const direccion = kg?.address || null;
+  const telefono = kg?.phoneNumber || null;
+  const sitioWebCandidato = kg?.website || null;
+
+  const linksParaRevisar = [
+    ...(sitioWebCandidato ? [sitioWebCandidato] : []),
+    ...organic.map((r) => r.link).filter((l): l is string => Boolean(l)),
+  ];
+
+  const redesSocialesMap = new Map<string, string>();
+  for (const link of linksParaRevisar) {
+    const red = redSocialParaUrl(link);
+    if (red && !redesSocialesMap.has(red.red)) redesSocialesMap.set(red.red, red.url);
+  }
+  const redesSociales = Array.from(redesSocialesMap, ([red, url]) => ({ red, url }));
+
+  // El sitio web del knowledgeGraph a veces es en realidad una página de red
+  // social (p. ej. Google indexa el Facebook como "sitio oficial") — en ese
+  // caso no lo mostramos como "sitio web" aparte, ya está en redesSociales.
+  const sitioWeb =
+    sitioWebCandidato && !redSocialParaUrl(sitioWebCandidato) ? sitioWebCandidato : null;
+
+  const primerResultadoUtil = organic.find((r) => r.link && !redSocialParaUrl(r.link));
+  const linkMasInformacion = sitioWeb || primerResultadoUtil?.link || organic[0]?.link || null;
+
+  const encontrado = Boolean(
+    direccion || telefono || sitioWeb || redesSociales.length || linkMasInformacion
+  );
+
+  return { esLista: false as const, encontrado, direccion, telefono, sitioWeb, redesSociales, linkMasInformacion };
+}
+
+async function buscarListadoDeProveedores(apiKey: string, query: string) {
+  const resp = await fetch("https://google.serper.dev/places", {
+    method: "POST",
+    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ q: query, gl: "co", hl: "es" }),
+  });
+  if (!resp.ok) throw new Error(`Serper /places respondió ${resp.status}`);
+  const data = (await resp.json()) as SerperPlacesResponse;
+  const places = Array.isArray(data.places) ? data.places : [];
+
+  const resultados = places.map((p) => ({
+    nombre: p.title || "Sin nombre",
+    direccion: p.address || null,
+    telefono: p.phoneNumber || null,
+    sitioWeb: p.website || null,
+    linkMasInformacion: p.website || null,
+    categoria: p.category || null,
+    calificacion: typeof p.rating === "number" ? p.rating : null,
+  }));
+
+  return { esLista: true as const, resultados };
 }
 
 export async function POST(req: NextRequest) {
@@ -94,83 +181,31 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Falta el campo "nombre".' }, { status: 400, headers: CORS_HEADERS });
   }
 
-  // "nombre" puede ser el nombre exacto de un proveedor (se busca entre
-  // comillas, como frase exacta) o una descripción genérica armada a partir
-  // de los filtros activos en el buscador (ej. "Proveedores de Alimentación"
-  // cuando no se escribió ningún texto libre) — en ese caso no tiene sentido
-  // forzarlo como frase exacta.
-  const nombreEsGenerico = /^proveedores(\s|$)/i.test(nombre);
-  const nombreParaQuery = nombreEsGenerico ? nombre : `"${nombre}"`;
+  // "nombre" puede ser el nombre exacto de un proveedor (base interna o texto
+  // libre escrito a mano) o una descripción genérica armada a partir de los
+  // filtros activos cuando no se escribió ningún texto (ej. "Proveedores de
+  // Alimentación") — en ese segundo caso lo que se quiere es un LISTADO de
+  // negocios candidatos, no la ficha de una sola empresa.
+  const esBusquedaGenerica = /^proveedores(\s|$)/i.test(nombre);
 
-  const query = [nombreParaQuery, body.categoria?.trim(), body.municipio?.trim(), body.region?.trim(), "Colombia"]
-    .filter(Boolean)
-    .join(" ");
-
-  let serperData: SerperResponse;
   try {
-    const resp = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ q: query, gl: "co", hl: "es", num: 10 }),
-    });
-    if (!resp.ok) {
-      return NextResponse.json(
-        { error: `El servicio de búsqueda respondió con estado ${resp.status}.` },
-        { status: 502, headers: CORS_HEADERS }
-      );
+    if (esBusquedaGenerica) {
+      const query = [nombre, body.municipio?.trim(), body.region?.trim(), "Colombia"]
+        .filter(Boolean)
+        .join(" ");
+      const resultado = await buscarListadoDeProveedores(apiKey, query);
+      return NextResponse.json(resultado, { headers: CORS_HEADERS });
     }
-    serperData = (await resp.json()) as SerperResponse;
+
+    const query = [`"${nombre}"`, body.categoria?.trim(), body.municipio?.trim(), body.region?.trim(), "Colombia"]
+      .filter(Boolean)
+      .join(" ");
+    const resultado = await buscarUnProveedor(apiKey, query);
+    return NextResponse.json(resultado, { headers: CORS_HEADERS });
   } catch {
     return NextResponse.json(
       { error: "No se pudo contactar el servicio de búsqueda en internet." },
       { status: 502, headers: CORS_HEADERS }
     );
   }
-
-  const kg = serperData.knowledgeGraph;
-  const organic = Array.isArray(serperData.organic) ? serperData.organic : [];
-
-  const direccion = kg?.address || null;
-  const telefono = kg?.phoneNumber || null;
-  const sitioWebCandidato = kg?.website || null;
-
-  const linksParaRevisar = [
-    ...(sitioWebCandidato ? [sitioWebCandidato] : []),
-    ...organic.map((r) => r.link).filter((l): l is string => Boolean(l)),
-  ];
-
-  const redesSocialesMap = new Map<string, string>();
-  for (const link of linksParaRevisar) {
-    const red = redSocialParaUrl(link);
-    if (red && !redesSocialesMap.has(red.red)) redesSocialesMap.set(red.red, red.url);
-  }
-  const redesSociales = Array.from(redesSocialesMap, ([red, url]) => ({ red, url }));
-
-  // El sitio web del knowledgeGraph a veces es en realidad una página de red
-  // social (p. ej. Google indexa el Facebook como "sitio oficial") — en ese
-  // caso no lo mostramos como "sitio web" aparte, ya está en redesSociales.
-  const sitioWeb =
-    sitioWebCandidato && !redSocialParaUrl(sitioWebCandidato) ? sitioWebCandidato : null;
-
-  const primerResultadoUtil = organic.find((r) => r.link && !redSocialParaUrl(r.link));
-  const linkMasInformacion = sitioWeb || primerResultadoUtil?.link || organic[0]?.link || null;
-
-  const encontrado = Boolean(
-    direccion || telefono || sitioWeb || redesSociales.length || linkMasInformacion
-  );
-
-  return NextResponse.json(
-    {
-      encontrado,
-      direccion,
-      telefono,
-      sitioWeb,
-      redesSociales,
-      linkMasInformacion,
-    },
-    { headers: CORS_HEADERS }
-  );
 }
