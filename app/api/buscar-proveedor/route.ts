@@ -1,5 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 
+// El HTML del Buscador de Proveedores se abre como archivo local (file://) o
+// desde distintos lugares (SharePoint, un servidor interno, etc.), así que
+// no hay un único origen fijo que permitir — se abre a cualquiera. La única
+// protección real contra abuso es el header X-Api-Key (ver más abajo).
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Api-Key",
+};
+
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS_HEADERS });
+}
+
 /**
  * Este endpoint es la única pieza "nueva" del Buscador de Proveedores: el
  * Excel interno (ver /BuscadorProveedores en el repo) no tiene dirección,
@@ -53,7 +67,7 @@ export async function POST(req: NextRequest) {
   if (sharedSecret) {
     const provided = req.headers.get("x-api-key");
     if (provided !== sharedSecret) {
-      return NextResponse.json({ error: "No autorizado." }, { status: 401 });
+      return NextResponse.json({ error: "No autorizado." }, { status: 401, headers: CORS_HEADERS });
     }
   }
 
@@ -61,7 +75,7 @@ export async function POST(req: NextRequest) {
   if (!apiKey) {
     return NextResponse.json(
       { error: "Falta configurar SERPER_API_KEY en el servidor." },
-      { status: 500 }
+      { status: 500, headers: CORS_HEADERS }
     );
   }
 
@@ -71,13 +85,13 @@ export async function POST(req: NextRequest) {
   } catch {
     return NextResponse.json(
       { error: 'Cuerpo de la petición inválido, se esperaba JSON con al menos "nombre".' },
-      { status: 400 }
+      { status: 400, headers: CORS_HEADERS }
     );
   }
 
   const nombre = (body.nombre || "").trim();
   if (!nombre) {
-    return NextResponse.json({ error: 'Falta el campo "nombre".' }, { status: 400 });
+    return NextResponse.json({ error: 'Falta el campo "nombre".' }, { status: 400, headers: CORS_HEADERS });
   }
 
   // "nombre" puede ser el nombre exacto de un proveedor (se busca entre
@@ -105,14 +119,14 @@ export async function POST(req: NextRequest) {
     if (!resp.ok) {
       return NextResponse.json(
         { error: `El servicio de búsqueda respondió con estado ${resp.status}.` },
-        { status: 502 }
+        { status: 502, headers: CORS_HEADERS }
       );
     }
     serperData = (await resp.json()) as SerperResponse;
   } catch {
     return NextResponse.json(
       { error: "No se pudo contactar el servicio de búsqueda en internet." },
-      { status: 502 }
+      { status: 502, headers: CORS_HEADERS }
     );
   }
 
@@ -148,12 +162,15 @@ export async function POST(req: NextRequest) {
     direccion || telefono || sitioWeb || redesSociales.length || linkMasInformacion
   );
 
-  return NextResponse.json({
-    encontrado,
-    direccion,
-    telefono,
-    sitioWeb,
-    redesSociales,
-    linkMasInformacion,
-  });
+  return NextResponse.json(
+    {
+      encontrado,
+      direccion,
+      telefono,
+      sitioWeb,
+      redesSociales,
+      linkMasInformacion,
+    },
+    { headers: CORS_HEADERS }
+  );
 }
